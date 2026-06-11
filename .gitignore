@@ -86,3 +86,65 @@ prime
 stage
 *.snap
 /snap/snapcraft.yaml
+
+
+# =============================================================================
+# MinervaDB-Sysbench Enterprise Additions
+# =============================================================================
+
+# Secret configuration overrides (contain real passwords — NEVER commit)
+enterprise/config/*.local.env
+enterprise/config/*.secrets.env
+*.local.env
+*.secrets.env
+
+# Benchmark result files (large, auto-generated — store in artifact storage)
+enterprise/results/
+# Uncomment to allow tracking specific result files:
+# !enterprise/results/.gitkeep
+
+# Raw sysbench log files
+enterprise/**/*-raw.log
+enterprise/**/*.log
+
+# Temporary files created during benchmark runs
+enterprise/tmp/
+enterprise/**/*.tmp
+testfiles.*
+
+# Docker-specific
+enterprise/docker/mysql-init/*.sql.bak
+.env
+.env.local
+.env.*.local
+
+# Generated CSV reports (large datasets)
+enterprise/results/*.csv
+
+# Archive files from result rotation
+*.tar.gz
+*.tar.bz2
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# OS files
+.DS_Store
+Thumbs.db
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.settings/
+
+# CI/CD temporary files
+.github/workflows/*.tmp
