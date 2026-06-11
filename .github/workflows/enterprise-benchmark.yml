@@ -1,0 +1,311 @@
+# =============================================================================
+# MinervaDB-Sysbench Enterprise — GitHub Actions CI/CD Pipeline
+# =============================================================================
+# Triggers: Nightly (2AM UTC), manual dispatch, PR smoke tests, push to main
+# Secrets needed: BENCH_DB_HOST, BENCH_DB_USER, BENCH_DB_PASSWORD, BENCH_DB_NAME
+#                SLACK_BENCH_WEBHOOK (optional), PROMETHEUS_PUSHGATEWAY (optional)
+# =============================================================================
+
+name: Enterprise Database Benchmark
+
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: 'Benchmark profile (dev/staging/production)'
+        required: true
+        default: staging
+        type: choice
+        options: [dev, staging, production]
+      workload:
+        description: 'sysbench workload to run'
+        required: true
+        default: oltp_read_write
+        type: choice
+        options:
+          - oltp_read_write
+          - oltp_read_only
+          - oltp_write_only
+          - oltp_point_select
+          - oltp_insert
+          - cpu
+          - memory
+      threads:
+        description: 'Override thread count from profile'
+        required: false
+        default: ''
+      duration:
+        description: 'Override duration (seconds) from profile'
+        required: false
+        default: ''
+  pull_request:
+    branches: [master, main]
+    paths:
+      - 'enterprise/**'
+      - '.github/workflows/enterprise-benchmark.yml'
+  push:
+    branches: [master, main]
+    paths: ['enterprise/scripts/**', 'enterprise/config/**']
+
+concurrency:
+  group: benchmark-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SYSBENCH_VERSION: '1.0.20'
+  DEFAULT_PROFILE: staging
+  DEFAULT_WORKLOAD: oltp_read_write
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Validate configuration and shell scripts
+  # ---------------------------------------------------------------------------
+  validate:
+    name: Validate Configuration
+    runs-on: ubuntu-22.04
+    outputs:
+      profile: ${{ steps.params.outputs.profile }}
+      workload: ${{ steps.params.outputs.workload }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve benchmark parameters
+        id: params
+        run: |
+          if [[ '${{ github.event_name }}' == 'pull_request' ]]; then
+            echo 'profile=dev' >> $GITHUB_OUTPUT
+            echo 'workload=oltp_read_write' >> $GITHUB_OUTPUT
+          elif [[ '${{ github.event_name }}' == 'schedule' ]]; then
+            echo 'profile=staging' >> $GITHUB_OUTPUT
+            echo 'workload=oltp_read_write' >> $GITHUB_OUTPUT
+          else
+            echo 'profile=${{ github.event.inputs.profile || env.DEFAULT_PROFILE }}' >> $GITHUB_OUTPUT
+            echo 'workload=${{ github.event.inputs.workload || env.DEFAULT_WORKLOAD }}' >> $GITHUB_OUTPUT
+          fi
+
+      - name: Validate enterprise files
+        run: |
+          for f in enterprise/scripts/run_benchmark.sh enterprise/config/profile.template.env; do
+            [[ -f "$f" ]] || { echo "Missing: $f"; exit 1; }
+          done
+          echo 'All required enterprise files present'
+
+      - name: Lint shell scripts (shellcheck)
+        uses: ludeeus/action-shellcheck@master
+        with:
+          scandir: ./enterprise/scripts
+          severity: warning
+        continue-on-error: true
+
+  # ---------------------------------------------------------------------------
+  # 2. Prepare benchmark tables
+  # ---------------------------------------------------------------------------
+  prepare:
+    name: Prepare Tables
+    runs-on: ubuntu-22.04
+    needs: validate
+    environment: benchmark
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install sysbench
+        run: |
+          curl -fsSL https://packagecloud.io/install/repositories/akopytov/sysbench/script.deb.sh | sudo bash
+          sudo apt-get install -y sysbench jq bc
+          sysbench --version
+
+      - name: Build CI profile
+        run: |
+          PROFILE=${{ needs.validate.outputs.profile }}
+          cp enterprise/config/profile.template.env enterprise/config/${PROFILE}-ci.env
+          printf '\nSB_TABLES=4\nSB_TABLE_SIZE=10000\nSB_TIME=60\nSB_THREADS=8\n' >> enterprise/config/${PROFILE}-ci.env
+          printf 'SB_WARMUP_TIME=10\nRESULTS_DIR=./enterprise/results\nOUTPUT_FORMAT=json\n' >> enterprise/config/${PROFILE}-ci.env
+
+      - name: Prepare benchmark tables
+        env:
+          DB_HOST: ${{ secrets.BENCH_DB_HOST }}
+          DB_USER: ${{ secrets.BENCH_DB_USER }}
+          DB_PASSWORD: ${{ secrets.BENCH_DB_PASSWORD }}
+          DB_NAME: ${{ secrets.BENCH_DB_NAME || 'sbtest' }}
+        run: |
+          chmod +x enterprise/scripts/run_benchmark.sh
+          ./enterprise/scripts/run_benchmark.sh \
+            --profile ${{ needs.validate.outputs.profile }}-ci \
+            --workload ${{ needs.validate.outputs.workload }} \
+            --command prepare
+
+  # ---------------------------------------------------------------------------
+  # 3. Run benchmark
+  # ---------------------------------------------------------------------------
+  benchmark:
+    name: Run Benchmark (${{ needs.validate.outputs.workload }})
+    runs-on: ubuntu-22.04
+    needs: [validate, prepare]
+    environment: benchmark
+    timeout-minutes: 30
+    outputs:
+      result_file: ${{ steps.run.outputs.result_file }}
+      slo_status: ${{ steps.run.outputs.slo_status }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install sysbench
+        run: |
+          curl -fsSL https://packagecloud.io/install/repositories/akopytov/sysbench/script.deb.sh | sudo bash
+          sudo apt-get install -y sysbench jq bc
+
+      - name: Build CI profile
+        run: |
+          PROFILE=${{ needs.validate.outputs.profile }}
+          cp enterprise/config/profile.template.env enterprise/config/${PROFILE}-ci.env
+          printf '\nSB_TABLES=4\nSB_TABLE_SIZE=10000\nSB_TIME=60\nSB_THREADS=8\n' >> enterprise/config/${PROFILE}-ci.env
+          printf 'SB_WARMUP_TIME=10\nRESULTS_DIR=./enterprise/results\nOUTPUT_FORMAT=json\n' >> enterprise/config/${PROFILE}-ci.env
+
+      - name: Create results directory
+        run: mkdir -p enterprise/results
+
+      - name: Execute benchmark
+        id: run
+        env:
+          DB_HOST: ${{ secrets.BENCH_DB_HOST }}
+          DB_USER: ${{ secrets.BENCH_DB_USER }}
+          DB_PASSWORD: ${{ secrets.BENCH_DB_PASSWORD }}
+          DB_NAME: ${{ secrets.BENCH_DB_NAME || 'sbtest' }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_BENCH_WEBHOOK }}
+          PROMETHEUS_PUSHGATEWAY: ${{ secrets.PROMETHEUS_PUSHGATEWAY }}
+        run: |
+          chmod +x enterprise/scripts/run_benchmark.sh
+          ARGS='--profile ${{ needs.validate.outputs.profile }}-ci'
+          ARGS="$ARGS --workload ${{ needs.validate.outputs.workload }}"
+          ARGS="$ARGS --command run"
+          [[ -n '${{ github.event.inputs.threads }}' ]] && ARGS="$ARGS --threads ${{ github.event.inputs.threads }}"
+          [[ -n '${{ github.event.inputs.duration }}' ]] && ARGS="$ARGS --time ${{ github.event.inputs.duration }}"
+          set +e
+          ./enterprise/scripts/run_benchmark.sh $ARGS
+          EXIT_CODE=$?
+          set -e
+          RESULT_FILE=$(ls -t enterprise/results/*.json 2>/dev/null | head -1)
+          echo "result_file=${RESULT_FILE}" >> $GITHUB_OUTPUT
+          SLO=$(jq -r '.slo_status // "UNKNOWN"' "$RESULT_FILE" 2>/dev/null || echo 'UNKNOWN')
+          echo "slo_status=${SLO}" >> $GITHUB_OUTPUT
+          exit $EXIT_CODE
+
+      - name: Write job summary
+        if: always()
+        run: |
+          RESULT_FILE=$(ls -t enterprise/results/*.json 2>/dev/null | head -1)
+          if [[ -n "$RESULT_FILE" ]]; then
+            echo '## MinervaDB-Sysbench Benchmark Results' >> $GITHUB_STEP_SUMMARY
+            echo '' >> $GITHUB_STEP_SUMMARY
+            echo '| Metric | Value |' >> $GITHUB_STEP_SUMMARY
+            echo '|--------|-------|' >> $GITHUB_STEP_SUMMARY
+            jq -r '"| TPS | " + (.results.tps|tostring) + " |",
+                   "| QPS | " + (.results.qps|tostring) + " |",
+                   "| P95 Latency | " + (.results.latency_p95_ms|tostring) + " ms |",
+                   "| P99 Latency | " + (.results.latency_p99_ms|tostring) + " ms |",
+                   "| Errors/sec | " + (.results.errors_per_sec|tostring) + " |",
+                   "| SLO Status | " + .slo_status + " |"' "$RESULT_FILE" >> $GITHUB_STEP_SUMMARY || true
+          fi
+
+      - name: Upload results artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: benchmark-results-${{ github.run_id }}
+          path: enterprise/results/
+          retention-days: 90
+
+  # ---------------------------------------------------------------------------
+  # 4. Cleanup (always runs, even if benchmark fails)
+  # ---------------------------------------------------------------------------
+  cleanup:
+    name: Cleanup Tables
+    runs-on: ubuntu-22.04
+    needs: [validate, benchmark]
+    if: always()
+    environment: benchmark
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install sysbench
+        run: |
+          curl -fsSL https://packagecloud.io/install/repositories/akopytov/sysbench/script.deb.sh | sudo bash
+          sudo apt-get install -y sysbench
+
+      - name: Build CI profile
+        run: |
+          PROFILE=${{ needs.validate.outputs.profile }}
+          cp enterprise/config/profile.template.env enterprise/config/${PROFILE}-ci.env
+
+      - name: Drop benchmark tables
+        env:
+          DB_HOST: ${{ secrets.BENCH_DB_HOST }}
+          DB_USER: ${{ secrets.BENCH_DB_USER }}
+          DB_PASSWORD: ${{ secrets.BENCH_DB_PASSWORD }}
+          DB_NAME: ${{ secrets.BENCH_DB_NAME || 'sbtest' }}
+        run: |
+          chmod +x enterprise/scripts/run_benchmark.sh
+          ./enterprise/scripts/run_benchmark.sh \
+            --profile ${{ needs.validate.outputs.profile }}-ci \
+            --workload ${{ needs.validate.outputs.workload }} \
+            --command cleanup || echo 'Cleanup warning: non-zero exit (tables may not exist)'
+
+  # ---------------------------------------------------------------------------
+  # 5. Nightly multi-workload matrix (scheduled runs only)
+  # ---------------------------------------------------------------------------
+  nightly-matrix:
+    name: Nightly Matrix (${{ matrix.workload }})
+    runs-on: ubuntu-22.04
+    needs: [validate, benchmark]
+    if: github.event_name == 'schedule'
+    environment: benchmark
+    strategy:
+      fail-fast: false
+      matrix:
+        workload:
+          - oltp_read_only
+          - oltp_write_only
+          - oltp_point_select
+          - cpu
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install sysbench
+        run: |
+          curl -fsSL https://packagecloud.io/install/repositories/akopytov/sysbench/script.deb.sh | sudo bash
+          sudo apt-get install -y sysbench jq bc
+
+      - name: Build CI profile
+        run: |
+          cp enterprise/config/profile.template.env enterprise/config/staging-ci.env
+          printf '\nSB_TABLES=4\nSB_TABLE_SIZE=10000\nSB_TIME=120\nSB_THREADS=16\n' >> enterprise/config/staging-ci.env
+          printf 'SB_WARMUP_TIME=15\nRESULTS_DIR=./enterprise/results\nOUTPUT_FORMAT=json\n' >> enterprise/config/staging-ci.env
+
+      - name: Prepare & Run ${{ matrix.workload }}
+        env:
+          DB_HOST: ${{ secrets.BENCH_DB_HOST }}
+          DB_USER: ${{ secrets.BENCH_DB_USER }}
+          DB_PASSWORD: ${{ secrets.BENCH_DB_PASSWORD }}
+          DB_NAME: ${{ secrets.BENCH_DB_NAME || 'sbtest' }}
+          PROMETHEUS_PUSHGATEWAY: ${{ secrets.PROMETHEUS_PUSHGATEWAY }}
+        run: |
+          mkdir -p enterprise/results
+          chmod +x enterprise/scripts/run_benchmark.sh
+          if [[ '${{ matrix.workload }}' == oltp_* ]]; then
+            ./enterprise/scripts/run_benchmark.sh --profile staging-ci --workload ${{ matrix.workload }} --command prepare
+          fi
+          ./enterprise/scripts/run_benchmark.sh --profile staging-ci --workload ${{ matrix.workload }} --command run || true
+          if [[ '${{ matrix.workload }}' == oltp_* ]]; then
+            ./enterprise/scripts/run_benchmark.sh --profile staging-ci --workload ${{ matrix.workload }} --command cleanup || true
+          fi
+
+      - name: Upload ${{ matrix.workload }} results
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-${{ matrix.workload }}-${{ github.run_id }}
+          path: enterprise/results/
+          retention-days: 30
