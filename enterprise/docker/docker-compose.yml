@@ -1,0 +1,229 @@
+# =============================================================================
+# MinervaDB-Sysbench Enterprise — Docker Compose Stack
+# =============================================================================
+# Provides a complete, self-contained benchmark environment with:
+#   - MySQL 8.0 target database (pre-configured for benchmarking)
+#   - Prometheus for metrics collection
+#   - Pushgateway for sysbench metric ingestion
+#   - Grafana pre-loaded with MinervaDB-Sysbench dashboard
+#   - sysbench runner container
+#
+# Quick Start:
+#   export DB_PASSWORD=benchmarkpassword
+#   docker-compose up --abort-on-container-exit
+#
+# Environment Variables:
+#   DB_PASSWORD     - MySQL root/benchmark user password (required)
+#   SB_WORKLOAD     - sysbench workload (default: oltp_read_write)
+#   SB_THREADS      - Thread count (default: 16)
+#   SB_TIME         - Duration in seconds (default: 120)
+#   SB_TABLES       - Number of tables (default: 8)
+#   SB_TABLE_SIZE   - Rows per table (default: 100000)
+# =============================================================================
+
+version: '3.8'
+
+# ---------------------------------------------------------------------------
+# Shared network
+# ---------------------------------------------------------------------------
+networks:
+  bench-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+
+# ---------------------------------------------------------------------------
+# Named volumes
+# ---------------------------------------------------------------------------
+volumes:
+  mysql-data:
+    driver: local
+  prometheus-data:
+    driver: local
+  grafana-data:
+    driver: local
+  results:
+    driver: local
+
+# ---------------------------------------------------------------------------
+# Services
+# ---------------------------------------------------------------------------
+services:
+
+  # -------------------------------------------------------------------------
+  # MySQL 8.0 — Benchmark Target Database
+  # -------------------------------------------------------------------------
+  mysql:
+    image: mysql:8.0
+    container_name: minervadb-bench-mysql
+    restart: unless-stopped
+    networks:
+      bench-net:
+        ipv4_address: 172.30.0.10
+    ports:
+      - "13306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./mysql-init:/docker-entrypoint-initdb.d:ro
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD environment variable is required}
+      MYSQL_DATABASE: sbtest
+      MYSQL_USER: sbtest
+      MYSQL_PASSWORD: ${DB_PASSWORD}
+    command: >
+      --innodb-buffer-pool-size=512M
+      --innodb-log-file-size=256M
+      --innodb-flush-log-at-trx-commit=2
+      --innodb-flush-method=O_DIRECT
+      --max-connections=500
+      --skip-name-resolve=ON
+      --performance-schema=ON
+      --slow-query-log=ON
+      --slow-query-log-file=/var/lib/mysql/slow.log
+      --long-query-time=1
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "sbtest", "-p${DB_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    labels:
+      - "com.minervadb.role=database"
+      - "com.minervadb.component=benchmark-target"
+
+  # -------------------------------------------------------------------------
+  # Prometheus Pushgateway — Metric Ingestion
+  # -------------------------------------------------------------------------
+  pushgateway:
+    image: prom/pushgateway:v1.7.0
+    container_name: minervadb-bench-pushgateway
+    restart: unless-stopped
+    networks:
+      bench-net:
+        ipv4_address: 172.30.0.20
+    ports:
+      - "9091:9091"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9091/-/healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    labels:
+      - "com.minervadb.role=metrics"
+
+  # -------------------------------------------------------------------------
+  # Prometheus — Metrics Storage
+  # -------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.49.0
+    container_name: minervadb-bench-prometheus
+    restart: unless-stopped
+    networks:
+      bench-net:
+        ipv4_address: 172.30.0.21
+    ports:
+      - "9090:9090"
+    volumes:
+      - prometheus-data:/prometheus
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.enable-lifecycle'
+    depends_on:
+      pushgateway:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9090/-/healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    labels:
+      - "com.minervadb.role=metrics"
+
+  # -------------------------------------------------------------------------
+  # Grafana — Visualization
+  # -------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:10.2.0
+    container_name: minervadb-bench-grafana
+    restart: unless-stopped
+    networks:
+      bench-net:
+        ipv4_address: 172.30.0.22
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../dashboards:/var/lib/grafana/dashboards:ro
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-minervadb}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/minervadb-sysbench-grafana.json
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    labels:
+      - "com.minervadb.role=visualization"
+
+  # -------------------------------------------------------------------------
+  # sysbench Runner — Executes the benchmark
+  # The runner exits when the benchmark completes; use --abort-on-container-exit
+  # -------------------------------------------------------------------------
+  sysbench-runner:
+    build:
+      context: ../..
+      dockerfile: enterprise/docker/Dockerfile.enterprise
+    image: minervadb-sysbench:enterprise
+    container_name: minervadb-bench-runner
+    networks:
+      - bench-net
+    volumes:
+      - results:/results
+      - ../../enterprise/config:/opt/minervadb-sysbench/config:ro
+    environment:
+      DB_HOST: 172.30.0.10
+      DB_PORT: 3306
+      DB_USER: sbtest
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_NAME: sbtest
+      DB_TYPE: mysql
+      SB_THREADS: ${SB_THREADS:-16}
+      SB_TIME: ${SB_TIME:-120}
+      SB_TABLES: ${SB_TABLES:-8}
+      SB_TABLE_SIZE: ${SB_TABLE_SIZE:-100000}
+      SB_WARMUP_TIME: "15"
+      SB_REPORT_INTERVAL: "10"
+      RESULTS_DIR: /results
+      OUTPUT_FORMAT: json
+      PROMETHEUS_PUSHGATEWAY: http://172.30.0.20:9091
+    depends_on:
+      mysql:
+        condition: service_healthy
+      pushgateway:
+        condition: service_healthy
+    command:
+      - "--profile"
+      - "docker"
+      - "--workload"
+      - "${SB_WORKLOAD:-oltp_read_write}"
+      - "--command"
+      - "run"
+    labels:
+      - "com.minervadb.role=benchmark-runner"
+
+# ---------------------------------------------------------------------------
+# Compose profiles for different use cases
+# ---------------------------------------------------------------------------
+# Use 'docker-compose --profile full up' for Prometheus + Grafana
+# Use 'docker-compose up mysql sysbench-runner' for quick benchmark-only
