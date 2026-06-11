@@ -1,0 +1,129 @@
+# =============================================================================
+# MinervaDB-Sysbench Enterprise — Production Docker Image
+# =============================================================================
+# Multi-stage build for a minimal, secure sysbench container image.
+#
+# Usage:
+#   # Build
+#   docker build -f enterprise/docker/Dockerfile.enterprise \
+#                -t minervadb-sysbench:enterprise .
+#
+#   # Run against an existing database
+#   docker run --rm \
+#     -e DB_HOST=10.0.1.50 \
+#     -e DB_USER=sbtest \
+#     -e DB_PASSWORD=secret \
+#     -e DB_NAME=sbtest \
+#     -v $(pwd)/enterprise/results:/results \
+#     minervadb-sysbench:enterprise \
+#     --profile dev --workload oltp_read_write --command run
+#
+#   # Run the full benchmark stack with docker-compose
+#   docker-compose -f enterprise/docker/docker-compose.yml up
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Stage 1: Builder — compile sysbench from source
+# ---------------------------------------------------------------------------
+FROM ubuntu:22.04 AS builder
+
+ARG SYSBENCH_VERSION=1.0.20
+ARG DEBIAN_FRONTEND=noninteractive
+
+LABEL stage=builder
+
+# Install build dependencies
+RUN apt-get update -qq && apt-get install -y --no-install-recommends \
+    make automake libtool pkg-config \
+    libaio-dev libssl-dev libmysqlclient-dev libpq-dev \
+    git curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Build sysbench from source for the target version
+WORKDIR /build
+RUN git clone --depth=1 --branch ${SYSBENCH_VERSION} \
+    https://github.com/akopytov/sysbench.git . && \
+    ./autogen.sh && \
+    ./configure --with-mysql --with-pgsql --prefix=/usr/local && \
+    make -j$(nproc) && \
+    make install DESTDIR=/sysbench-dist && \
+    # Verify the build
+    /sysbench-dist/usr/local/bin/sysbench --version
+
+# ---------------------------------------------------------------------------
+# Stage 2: Runtime — minimal production image
+# ---------------------------------------------------------------------------
+FROM ubuntu:22.04 AS runtime
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+# Image metadata
+LABEL org.opencontainers.image.title="MinervaDB-Sysbench Enterprise" \
+      org.opencontainers.image.description="Production-ready database benchmark container" \
+      org.opencontainers.image.url="https://github.com/MinervaDB/MinervaDB-Sysbench" \
+      org.opencontainers.image.vendor="MinervaDB" \
+      org.opencontainers.image.licenses="GPL-2.0"
+
+# Install runtime dependencies only (no build tools)
+RUN apt-get update -qq && apt-get install -y --no-install-recommends \
+    # sysbench runtime dependencies
+    libaio1 libssl3 libmysqlclient21 libpq5 \
+    # Enterprise tooling
+    jq bc curl ca-certificates \
+    # Python for result processing
+    python3 python3-pip \
+    # Utilities
+    procps net-tools \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip3 install --no-cache-dir pyyaml tabulate requests
+
+# Copy sysbench binary and Lua scripts from builder
+COPY --from=builder /sysbench-dist/usr/local/bin/sysbench /usr/local/bin/sysbench
+COPY --from=builder /sysbench-dist/usr/local/share/sysbench /usr/local/share/sysbench
+
+# Create non-root service account for running benchmarks
+RUN groupadd -r minervadb && useradd -r -g minervadb -d /opt/minervadb-sysbench minervadb
+
+# Copy enterprise scripts and configurations
+COPY --chown=minervadb:minervadb enterprise/scripts/ /opt/minervadb-sysbench/scripts/
+COPY --chown=minervadb:minervadb enterprise/config/  /opt/minervadb-sysbench/config/
+COPY --chown=minervadb:minervadb enterprise/workloads/ /opt/minervadb-sysbench/workloads/ 2>/dev/null || true
+
+# Create results and log directories with correct permissions
+RUN mkdir -p /results /opt/minervadb-sysbench/logs \
+    && chown -R minervadb:minervadb /results /opt/minervadb-sysbench
+
+# Make scripts executable
+RUN chmod +x /opt/minervadb-sysbench/scripts/*.sh 2>/dev/null || true
+
+# Set working directory
+WORKDIR /opt/minervadb-sysbench
+
+# Run as non-root user
+USER minervadb
+
+# Environment variable defaults (override at runtime)
+ENV DB_TYPE=mysql \
+    DB_HOST=localhost \
+    DB_PORT=3306 \
+    DB_NAME=sbtest \
+    DB_USER=sbtest \
+    SB_THREADS=4 \
+    SB_TIME=60 \
+    SB_TABLES=4 \
+    SB_TABLE_SIZE=10000 \
+    RESULTS_DIR=/results \
+    OUTPUT_FORMAT=json
+
+# Expose results directory as a volume mount point
+VOLUME ["/results"]
+
+# Health check — verify sysbench is functional
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD sysbench --version || exit 1
+
+# Default entrypoint: run the enterprise orchestrator
+ENTRYPOINT ["/opt/minervadb-sysbench/scripts/run_benchmark.sh"]
+
+# Default command: show help
+CMD ["--help"]
